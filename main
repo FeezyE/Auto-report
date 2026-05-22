@@ -219,6 +219,10 @@ class GuideDialog(QDialog):
         self.setWindowTitle("📖 软件全功能使用指南")
         self.resize(850, 750)
 
+       # 关键：作为普通窗口显示，不锁主界面
+        self.setWindowFlag(Qt.Window, True)
+        self.setWindowModality(Qt.NonModal)
+
         layout = QVBoxLayout()
         self.browser = QTextBrowser()
         self.browser.setStyleSheet("font-size: 14px; line-height: 1.6; background-color: #fdfdfd; padding: 10px;")
@@ -1357,8 +1361,20 @@ class AppWindow(QWidget):
         dlg.exec_()
 
     def show_guide(self):
-        dlg = GuideDialog(self)
-        dlg.exec_()
+        if hasattr(self, 'guide_dialog') and self.guide_dialog is not None:
+           self.guide_dialog.show()
+           self.guide_dialog.raise_()
+           self.guide_dialog.activateWindow()
+           return
+
+        self.guide_dialog = GuideDialog(self)
+        self.guide_dialog.setModal(False)
+        self.guide_dialog.setWindowModality(Qt.NonModal)
+        self.guide_dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.guide_dialog.destroyed.connect(lambda: setattr(self, 'guide_dialog', None))
+        self.guide_dialog.show()
+        self.guide_dialog.raise_()
+        self.guide_dialog.activateWindow()
 
     def open_wind_calibration(self):
         dlg = WindCalibrationDialog(self, self.settings)
