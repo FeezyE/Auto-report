@@ -366,12 +366,56 @@ def calculate_comfort_report_data(df, wind_speeds=None, steady_start_idx=None, s
         final_report["data89"] = "N/A"
 
     # 4. 四通水阀模式 (data90)
-    valve4_series = global_steady_df.get('四通水阀状态（域控4.0）', pd.Series(dtype=float))
-    if not valve4_series.isna().all():
-        v4_mean = int(round(valve4_series.mean()))
-        valve4_map = {0: "无效", 1: "散热器小循环", 2: "大循环", 3: "板换小循环", 4: "中间位置"}
-        v4_txt = valve4_map.get(v4_mean, str(v4_mean))
-        final_report["data90"] = f"四通水阀模式: {v4_txt}"
+    # 原始列名可能包含字符串（如“大循环”），需要先映射成数字
+    valve4_series_raw = global_steady_df.get('四通水阀状态（域控4.0）', pd.Series(dtype=object))
+    if not valve4_series_raw.isna().all():
+        # 定义两个映射表
+        # ① 原始字符串 → 数值
+        str_to_valve_num = {
+            "无效": 0,
+            "散热器小循环": 1,
+            "大循环": 2,
+            "板换小循环": 3,
+            "中间位置": 4,
+            # 如果数据中还有别的字符串，可在此补充
+        }
+        # ② 数值 → 描述文字（与原始映射保持一致）
+        valve_num_to_desc = {
+            0: "无效",
+            1: "散热器小循环",
+            2: "大循环",
+            3: "板换小循环",
+            4: "中间位置",
+        }
+        
+        # 将列统一转换为数值
+        numeric_vals = []
+        for v in valve4_series_raw:
+            if pd.isna(v):
+                continue
+            if isinstance(v, (int, float)):
+                # 已经是数值，直接使用（但要确保在 0~4 范围内）
+                numeric_vals.append(v)
+            else:
+                # 字符串类型，尝试查找映射表
+                str_v = str(v).strip()
+                if str_v in str_to_valve_num:
+                    numeric_vals.append(str_to_valve_num[str_v])
+                else:
+                    # 未知字符串，记录警告并跳过（或赋默认值）
+                    print(f"警告: 未知的四通水阀状态 '{str_v}'，已忽略")
+        
+        if numeric_vals:
+            # 对转换后的数值求平均
+            v4_mean = np.mean(numeric_vals)
+            # 将平均数值取整（四舍五入）得到最接近的模式
+            v4_mode_int = int(round(v4_mean))
+            # 映射回描述文字
+            desc = valve_num_to_desc.get(v4_mode_int, f"未知模式({v4_mode_int})")
+            # 可选：在备注中保留平均数值（方便调试）
+            final_report["data90"] = f"四通水阀模式: {desc} (均值={v4_mean:.2f})"
+        else:
+            final_report["data90"] = "N/A"
     else:
         final_report["data90"] = "N/A"
 
