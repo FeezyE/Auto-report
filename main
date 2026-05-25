@@ -1517,19 +1517,27 @@ class AppWindow(QWidget):
         if not (blf and self.dbc_files and sig_text and csv):
             QMessageBox.warning(self, "提示", "提取核心配置未填妥，请检查必填项目")
             return
-
-        mapping = {}
+ 
+        mapping = {}  # key=英文, value=别名列表
         for line in sig_text.split('\n'):
             line = line.strip()
             if not line:
-                continue
+               continue
             if ':' in line:
-                parts = line.split(':', 1)
+               parts = line.split(':', 1)
             elif '：' in line:
-                parts = line.split('：', 1)
+               parts = line.split('：', 1)
             else:
-                parts = [line, line]
-            mapping[parts[0].strip()] = parts[1].strip()
+               parts = [line, line]
+            eng = parts[0].strip()
+            chi = parts[1].strip()
+            if not chi:
+               chi = eng
+            if eng not in mapping:
+               mapping[eng] = []
+            # 不添加重复的中文别名（可选）
+            if chi not in mapping[eng]:
+               mapping[eng].append(chi) 
 
         wind_speeds = [0.0]
         for lvl in range(10, 80, 10):
