@@ -474,6 +474,22 @@ class ConversionThread(QThread):
 
             existing_signals = [s for s in self.target_signals if s in df.columns]
             df = df[existing_signals]
+            # 支持多别名（值现在是列表）
+            rename_map = {}
+            extra_copies = []
+            for eng, aliases in self.signal_map.items():
+                if eng not in df.columns:
+                    continue
+                if aliases:
+                    rename_map[eng] = aliases[0]
+                    for alias in aliases[1:]:
+                        extra_copies.append((aliases[0], alias))
+            
+            df.rename(columns=rename_map, inplace=True)
+            
+            for src_name, new_name in extra_copies:
+                if src_name in df.columns:
+                    df[new_name] = df[src_name]
 
             before_rows = len(df)
             complete_rows = df.dropna(how='any')
