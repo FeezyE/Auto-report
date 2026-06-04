@@ -1669,6 +1669,70 @@ class AppWindow(QWidget):
         self.plot_thread.finished_signal.connect(self.on_plot_finished)
         self.plot_thread.start()
 
+    def add_wind_column_to_current_csv(self):
+    """直接在当前选中的CSV文件中补充【实际风速】列（修改原文件）"""
+        # 注意：这里用的是 self.plot_csv_input，不是 self.csv_path！
+        csv_path = self.plot_csv_input.text().strip()
+        if not csv_path or not os.path.exists(csv_path):
+            QMessageBox.warning(self, "错误", "请先选择有效的 CSV 文件！")
+            return
+    
+        if not HAS_SCIPY:
+            QMessageBox.critical(self, "缺少依赖", "该功能需要 scipy 库，请先安装：pip install scipy")
+            return
+    
+        # 读取 CSV（不解析时间索引，保持原始格式）
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            QMessageBox.critical(self, "读取失败", f"无法读取 CSV：{str(e)}")
+            return
+    
+        # 检查是否存在风速相关列
+        front_exist = '空调前鼓风机档位' in df.columns
+        rear_exist = '空调后鼓风机档位' in df.columns
+        if not front_exist and not rear_exist:
+            QMessageBox.information(self, "无需操作", "CSV 中未找到【空调前鼓风机档位】或【空调后鼓风机档位】列。")
+            return
+    
+        # 确认覆盖原文件
+        reply = QMessageBox.question(
+            self,
+            "确认修改",
+            f"即将在以下文件中添加/覆盖风速列：\n{csv_path}\n\n此操作会直接修改原文件，是否继续？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+    
+        # 读取当前标定参数并构建 PCHIP
+        wind_speeds = [0.0]
+        for lvl in range(10, 80, 10):
+            wind_speeds.append(self.settings.value(f"wind_speed_{lvl}", lvl / 10.0, type=float))
+    
+        from scipy.interpolate import PchipInterpolator
+        pchip = PchipInterpolator([0, 10, 20, 30, 40, 50, 60, 70], wind_speeds)
+    
+        # 前鼓风机
+        if front_exist:
+            gear = df['空调前鼓风机档位'].fillna(0).clip(0, 70)
+            df['实际风速'] = pchip(gear).clip(min=0)
+            self.log_output_plot.append("✅ 已为 CSV 添加【实际风速】列（前排）。")
+    
+        # 后鼓风机（排除255无效值）
+        if rear_exist:
+            rear_gear = df['空调后鼓风机档位'].replace(255, np.nan).fillna(0).clip(0, 70)
+            df['后排实际风速'] = pchip(rear_gear).clip(min=0)
+            self.log_output_plot.append("✅ 已为 CSV 添加【后排实际风速】列。")
+    
+        # 写回原文件（不修改时间列，index=False）
+        try:
+            df.to_csv(csv_path, index=False)
+            self.log_output_plot.append(f"💾 风速列已保存至原文件：{csv_path}")
+            QMessageBox.information(self, "完成", "实际风速列已成功添加到 CSV 文件中。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"写入文件出错：{str(e)}")
+
     def on_plot_finished(self, success, msg, img_paths=None):
         if img_paths is None:
             img_paths = {}
