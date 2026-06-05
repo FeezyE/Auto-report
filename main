@@ -1269,6 +1269,28 @@ class AppWindow(QWidget):
         src_layout.addWidget(btn_plot_src)
         layout.addLayout(src_layout)
 
+        # --- 新增：独立生成风速列按钮 ---
+        wind_gen_layout = QHBoxLayout()
+        wind_gen_layout.addWidget(QLabel("💡 若CSV中缺少实际风速列，可基于当前标定值补充："))
+        self.btn_gen_wind_col = QPushButton("💨 生成实际风速列")
+        self.btn_gen_wind_col.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800; 
+                color: white; 
+                font-weight: bold; 
+                padding: 6px 15px; 
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #FFB74D;
+            }
+        """)
+        self.btn_gen_wind_col.clicked.connect(self.generate_wind_column)
+        wind_gen_layout.addWidget(self.btn_gen_wind_col)
+        wind_gen_layout.addStretch()
+        layout.addLayout(wind_gen_layout)
+        # --------------------------------
+
         layout.addWidget(QLabel("\n2. [绘图控制] 指定绘图生成区间:"))
         range_layout = QHBoxLayout()
         self.range_start_input = QLineEdit()
