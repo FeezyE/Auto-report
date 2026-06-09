@@ -1,0 +1,1803 @@
+import sys
+import os
+import traceback
+import inspect
+import subprocess
+
+import can
+import cantools
+import pandas as pd
+import numpy as np
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QFileDialog,
+    QTextEdit, QListWidget, QMessageBox, QRadioButton,
+    QButtonGroup, QTabWidget, QComboBox, QDialog, QGridLayout,
+    QTextBrowser, QScrollArea
+)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QSettings, QPoint
+
+# ==========================================
+# 尝试导入高阶功能库
+# ==========================================
+try:
+    from scipy.interpolate import PchipInterpolator
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+try:
+    from docxtpl import DocxTemplate, InlineImage
+    from docx.shared import Mm
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    from comfort_report_calc import calculate_comfort_report_data
+    HAS_CALC = True
+except ImportError:
+    HAS_CALC = False
+
+try:
+    from heating_report_calc import calculate_heating_report_data
+    HAS_HEATING_CALC = True
+except ImportError:
+    HAS_HEATING_CALC = False
+
+# ==========================================
+# matplotlib 全局显示与字体调整区
+# ==========================================
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.titlesize'] = 18
+plt.rcParams['axes.labelsize'] = 14
+plt.rcParams['xtick.labelsize'] = 12
+plt.rcParams['ytick.labelsize'] = 12
+plt.rcParams['legend.fontsize'] = 13
+
+# ==========================================
+# 外部动态导入查表参数
+# ==========================================
+try:
+    from 查表参数 import df_target_temp, df_target_temp_F, tables, tables_foot
+    HAS_TABLES = True
+except ImportError:
+    HAS_TABLES = False
+
+
+# ==========================================
+# 独立子窗口：传感器快速映射面板
+# ==========================================
+class SensorMappingDialog(QDialog):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("🎛️ 座舱温度传感器快速映射面板")
+        self.resize(700, 600)
+
+        self.english_signals = [
+            "Temp_DrFaceL", "Temp_DrFaceR", "Temp_PsFaceL", "Temp_PsFaceR", "Temp_RrFaceL", "Temp_RrFaceR",
+            "Temp_DrFootL", "Temp_DrFootR", "Temp_PsFootL", "Temp_PsFootR", "Temp_RrFootL1", "Temp_RrFootL2", "Temp_RrFootR1", "Temp_RrFootR2",
+            "Temp_MidFaceL1", "Temp_MidFaceL2", "Temp_MidFaceR1", "Temp_MidFaceR2", "Temp_MidFootL1", "Temp_MidFootL2", "Temp_MidFootR1", "Temp_MidFootR2"
+        ]
+        self.chinese_parts = [
+            "主驾左脸", "主驾右脸", "副驾左脸", "副驾右脸", "后排左脸", "后排右脸",
+            "主驾左脚", "主驾右脚", "副驾左脚", "副驾右脚", "后排左脚1", "后排左脚2", "后排右脚1", "后排右脚2",
+            "中排左脸1", "中排左脸2", "中排右脸1", "中排右脸2", "中排左脚1", "中排左脚2", "中排右脚1", "中排右脚2"
+        ]
+
+        self.combos = {}
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("为左侧固定的传感器信号名，选择对应的中文特征位点：\n(空白项代表不配置该传感器，选定后点击下方覆盖按钮将一键组装至主界面)"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        grid = QGridLayout()
+        grid.setVerticalSpacing(12)
+        grid.setHorizontalSpacing(20)
+
+        for i, eng in enumerate(self.english_signals):
+            row = i // 2
+            col = (i % 2) * 2
+
+            lbl = QLabel(f"{eng} :")
+            lbl.setStyleSheet("font-weight: bold; color: #00796B;")
+            grid.addWidget(lbl, row, col)
+
+            cb = QComboBox()
+            cb.setEditable(True)
+            cb.addItem("")
+            cb.addItems(self.chinese_parts)
+            if i < len(self.chinese_parts):
+                cb.setCurrentText(self.chinese_parts[i])
+
+            self.combos[eng] = cb
+            grid.addWidget(cb, row, col + 1)
+
+        container.setLayout(grid)
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+        btn_apply = QPushButton("🔄 组装映射并覆盖至主界面目标信号列表")
+        btn_apply.setStyleSheet("background-color: #00838F; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        btn_apply.clicked.connect(self.apply_mappings)
+        layout.addWidget(btn_apply)
+
+        self.setLayout(layout)
+
+    def apply_mappings(self):
+        new_lines = []
+        for eng, cb in self.combos.items():
+            chi = cb.currentText().strip()
+            if chi:
+                new_lines.append(f"{eng} : {chi}")
+
+        if not new_lines:
+            self.accept()
+            return
+
+        current_text = self.main_window.signal_input.toPlainText()
+        lines = current_text.split('\n')
+
+        cleaned_lines = []
+        for line in lines:
+            if line.strip() == "" or not any(base_part in line for base_part in self.chinese_parts):
+                cleaned_lines.append(line)
+
+        new_text_block = "\n".join(new_lines)
+        old_text_block = "\n".join(cleaned_lines).strip('\n')
+
+        if old_text_block:
+            final_text = new_text_block + "\n\n" + old_text_block
+        else:
+            final_text = new_text_block
+
+        self.main_window.signal_input.setPlainText(final_text)
+        QMessageBox.information(self, "成功", "✅ 选中的传感器映射已成功插入至主界面信号列表的最上方！")
+        self.accept()
+
+
+# ==========================================
+# 独立子窗口：风量拟合标定
+# ==========================================
+class WindCalibrationDialog(QDialog):
+    def __init__(self, parent=None, settings=None):
+        super().__init__(parent)
+        self.setWindowTitle("🌀 空调前鼓风机档位 -> 实际风速 PCHIP 标定")
+        self.settings = settings
+        self.inputs = {}
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("请输入小风挡 10 到 70 对应的实际风速 (m/s)：\n(0挡程序默认对应 0 m/s，计算时将通过 PCHIP 模型进行区间平滑拟合)"))
+
+        grid = QGridLayout()
+        default_vals = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
+
+        for i, level in enumerate(range(10, 80, 10)):
+            grid.addWidget(QLabel(f"挡位 {level} :"), i, 0)
+            line_edit = QLineEdit()
+            saved_val = self.settings.value(f"wind_speed_{level}", default_vals[i], type=float)
+            line_edit.setText(str(saved_val))
+            self.inputs[level] = line_edit
+            grid.addWidget(line_edit, i, 1)
+            grid.addWidget(QLabel("m/s"), i, 2)
+
+        layout.addLayout(grid)
+
+        btn_save = QPushButton("💾 保存并应用")
+        btn_save.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
+        btn_save.clicked.connect(self.save_and_close)
+        layout.addWidget(btn_save)
+        self.setLayout(layout)
+
+    def save_and_close(self):
+        for level, line_edit in self.inputs.items():
+            try:
+                val = float(line_edit.text())
+                self.settings.setValue(f"wind_speed_{level}", val)
+            except ValueError:
+                QMessageBox.warning(self, "错误", f"挡位 {level} 的输入不合法，请填入纯数字！")
+                return
+
+        QMessageBox.information(self, "成功", "标定保存成功！提取 CSV 时将生成独立的【实际风速】列。")
+        self.accept()
+
+
+# ==========================================
+# 使用指南窗口
+# ==========================================
+class GuideDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📖 软件全功能使用指南")
+        self.resize(850, 750)
+
+        # 关键：作为普通窗口显示，不锁主界面
+        self.setWindowFlag(Qt.Window, True)
+        self.setWindowModality(Qt.NonModal)
+
+        layout = QVBoxLayout()
+        self.browser = QTextBrowser()
+        self.browser.setStyleSheet("font-size: 14px; line-height: 1.6; background-color: #fdfdfd; padding: 10px;")
+
+        guide_html = """
+        <h2 style='color: #2c3e50;'>🚗 CAN总线数据全自动分析与舒适性评测工作站</h2>
+        <p><b>核心能力：</b></p>
+        <ul>
+            <li>BLF 原始数据自动解析为 CSV</li>
+            <li>支持多 DBC 同时挂载，解决同 ID 不同库的冲突问题</li>
+            <li>支持座舱温度传感器快速映射</li>
+            <li>支持风量挡位到实际风速的 PCHIP 拟合</li>
+            <li>支持舒适性 6 / 6.5 / 7 分线基准绘图</li>
+            <li>支持手动指定稳态区间，或自动稳态判定</li>
+            <li>支持舒适性图表生成与 Word 自动填充报告</li>
+            <li>支持最大采暖评估及 Word 报告</li>
+        </ul>
+        <p><b>推荐流程：</b></p>
+        <ol>
+            <li>第1页配置 BLF / DBC / 信号 / 车型 / 季节 / 分线标准</li>
+            <li>提取 CSV</li>
+            <li>第2页检查绘图范围与稳态范围</li>
+            <li>生成常规图、舒适性图或最大采暖报告</li>
+        </ol>
+        <p><b>稳态说明：</b></p>
+        <p>若用户指定稳态区间，则图表靶线与报告指标均直接使用该区间；
+        若未指定，则按默认规则：连续 60 秒波动小于 0.2，或测试时长超过 30 分钟后进入稳态。</p>
+        """
+
+        self.browser.setHtml(guide_html)
+        layout.addWidget(self.browser)
+
+        btn_close = QPushButton("我知道了")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+        self.setLayout(layout)
+
+
+# ==========================================
+# 舒适性二维查表与动态计算引擎
+# ==========================================
+def calculate_comfort_limits(df, season, target_score, set_col='主驾设定温度',
+                             steady_start_idx=None, steady_end_idx=None, log_callback=None):
+    """
+    让前端画图查表的靶线逻辑，完全复用底层 comfort_report_calc.py 的稳态判定思路。
+    """
+    if not HAS_TABLES:
+        return df, "❌ 找不到或无法导入【查表参数.py】，退回 20/30℃ 上下限模式。"
+
+    if '车外温度' not in df.columns or set_col not in df.columns:
+        return df, f"⚠️ 未提取到 [车外温度] 或 [{set_col}]，退回静态模式。"
+
+    last_amb = df['车外温度'].iloc[-1]
+    is_winter = last_amb <= 15
+
+    if is_winter:
+        control_columns = [c for c in ['主驾左脚', '主驾右脚'] if c in df.columns]
+    else:
+        control_columns = [c for c in ['主驾左脸', '主驾右脸'] if c in df.columns]
+
+    steady_df = df
+
+    if steady_start_idx is not None:
+        start_idx = max(0, int(steady_start_idx))
+        end_idx = min(len(df), int(steady_end_idx)) if steady_end_idx is not None else len(df)
+        if start_idx < end_idx:
+            steady_df = df.iloc[start_idx:end_idx]
+            if log_callback:
+                log_callback(f"    📏 绘图靶线计算: 应用手动稳态区间 (行 {start_idx + 1} ~ {end_idx})")
+    else:
+        if control_columns:
+            control_series = df[control_columns].mean(axis=1)
+            rolling_max = control_series.rolling(window=60, min_periods=60).max()
+            rolling_min = control_series.rolling(window=60, min_periods=60).min()
+            fluctuation = rolling_max - rolling_min
+            steady_points = fluctuation[fluctuation < 0.2]
+
+            max_time_limit = df.index[0] + pd.Timedelta(minutes=30)
+
+            if not steady_points.empty and steady_points.index[0] <= max_time_limit:
+                steady_start_time = steady_points.index[0]
+                steady_df = df.loc[steady_start_time:]
+            elif df.index[-1] > max_time_limit:
+                steady_df = df.loc[max_time_limit:]
+            else:
+                steady_df = df.iloc[-60:] if len(df) > 60 else df
+
+            if log_callback:
+                if not steady_points.empty:
+                    log_callback(f"    📏 绘图靶线计算: 自动稳态起点 = {steady_points.index[0]}")
+                else:
+                    log_callback("    📏 绘图靶线计算: 未找到连续60秒<0.2波动区间，按30min兜底或末端数据处理。")
+
+    amb_raw = steady_df['车外温度'].mean()
+    set_raw = steady_df[set_col].mean()
+
+    mean_amb = int(round(amb_raw)) if not pd.isna(amb_raw) else 20
+    mean_set = int(round(set_raw)) if not pd.isna(set_raw) else 22
+
+    if log_callback:
+        log_callback(f"    🎯 图表渲染锁定基准: 外温={mean_amb}℃, 设定={mean_set}℃, 分线={target_score}")
+
+    amb_idx = max(-30, min(44, mean_amb))
+    st_idx_center = max(17, min(35, mean_set))
+    list_idx = st_idx_center - 17
+
+    try:
+        center_face_temp = df_target_temp.loc[amb_idx, st_idx_center]
+        center_foot_temp = df_target_temp_F.loc[amb_idx, st_idx_center]
+    except KeyError:
+        center_face_temp, center_foot_temp = 25.0, 28.0
+
+    def safe_val(arr, idx):
+        return arr[min(idx, len(arr) - 1)]
+
+    try:
+        face_upper_6 = tables[season]['upper'].get(6, tables[season]['upper'].get('6'))
+        face_upper_7 = tables[season]['upper'].get(7, tables[season]['upper'].get('7'))
+        face_lower_6 = tables[season]['lower'].get(6, tables[season]['lower'].get('6'))
+        face_lower_7 = tables[season]['lower'].get(7, tables[season]['lower'].get('7'))
+
+        foot_upper_6 = tables_foot[season]['upper'].get(6, tables_foot[season]['upper'].get('6'))
+        foot_upper_7 = tables_foot[season]['upper'].get(7, tables_foot[season]['upper'].get('7'))
+        foot_lower_6 = tables_foot[season]['lower'].get(6, tables_foot[season]['lower'].get('6'))
+        foot_lower_7 = tables_foot[season]['lower'].get(7, tables_foot[season]['lower'].get('7'))
+
+        if target_score == 6.0:
+            face_up_val = center_face_temp + abs(safe_val(face_upper_6, list_idx))
+            face_dn_val = center_face_temp - abs(safe_val(face_lower_6, list_idx))
+            foot_up_val = center_foot_temp + abs(safe_val(foot_upper_6, list_idx))
+            foot_dn_val = center_foot_temp - abs(safe_val(foot_lower_6, list_idx))
+        elif target_score == 7.0:
+            face_up_val = center_face_temp + abs(safe_val(face_upper_7, list_idx))
+            face_dn_val = center_face_temp - abs(safe_val(face_lower_7, list_idx))
+            foot_up_val = center_foot_temp + abs(safe_val(foot_upper_7, list_idx))
+            foot_dn_val = center_foot_temp - abs(safe_val(foot_lower_7, list_idx))
+        else:
+            face_up_val = center_face_temp + (abs(safe_val(face_upper_6, list_idx)) + abs(safe_val(face_upper_7, list_idx))) / 2.0
+            face_dn_val = center_face_temp - (abs(safe_val(face_lower_6, list_idx)) + abs(safe_val(face_lower_7, list_idx))) / 2.0
+            foot_up_val = center_foot_temp + (abs(safe_val(foot_upper_6, list_idx)) + abs(safe_val(foot_upper_7, list_idx))) / 2.0
+            foot_dn_val = center_foot_temp - (abs(safe_val(foot_lower_6, list_idx)) + abs(safe_val(foot_lower_7, list_idx))) / 2.0
+    except Exception as e:
+        if log_callback:
+            log_callback(f"⚠️ 查表异常，已切换为默认上下限模式。原因: {str(e)}")
+        face_up_val, face_dn_val, foot_up_val, foot_dn_val = 30.0, 20.0, 30.0, 20.0
+
+    score_str = str(target_score)
+    df[f'{score_str}分面部上限'] = face_up_val
+    df[f'{score_str}分面部下限'] = face_dn_val
+    df[f'{score_str}分脚部上限'] = foot_up_val
+    df[f'{score_str}分脚部下限'] = foot_dn_val
+
+    return df, "成功同步并生成对应靶线！"
+
+
+# ==========================================
+# 线程 1：数据提取转换线程
+# ==========================================
+class ConversionThread(QThread):
+    update_log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, blf_path, dbc_paths, signal_map, csv_path, output_mode,
+                 eval_mode, season, region_mode, wind_speeds, target_score,
+                 steady_start_idx, steady_end_idx):
+        super().__init__()
+        self.blf_path = blf_path
+        self.dbc_paths = dbc_paths
+        self.signal_map = signal_map
+        self.target_signals = list(signal_map.keys())
+        self.csv_path = csv_path
+        self.output_mode = output_mode
+        self.eval_mode = eval_mode
+        self.season = season
+        self.region_mode = region_mode
+        self.wind_speeds = wind_speeds
+        self.target_score = target_score
+        self.steady_start_idx = steady_start_idx
+        self.steady_end_idx = steady_end_idx
+
+    def run(self):
+        try:
+            databases = []
+            for dbc in self.dbc_paths:
+                db_temp = cantools.database.Database(strict=False)
+                try:
+                    with open(dbc, 'r', encoding='gbk') as f:
+                        db_temp.add_dbc_string(f.read())
+                except UnicodeDecodeError:
+                    with open(dbc, 'r', encoding='utf-8', errors='ignore') as f:
+                        db_temp.add_dbc_string(f.read())
+                databases.append(db_temp)
+
+            id_to_db_map = {}
+            for db in databases:
+                for msg in db.messages:
+                    found_signals = [s.name for s in msg.signals if s.name in self.target_signals]
+                    if found_signals:
+                        if msg.frame_id not in id_to_db_map:
+                            id_to_db_map[msg.frame_id] = []
+                        id_to_db_map[msg.frame_id].append((db, found_signals))
+
+            self.update_log_signal.emit(f"开始解析 BLF... 共监控 {len(id_to_db_map)} 个独立报文 ID")
+
+            log_reader = can.BLFReader(self.blf_path)
+            parsed_data = []
+            count = 0
+
+            for msg in log_reader:
+                count += 1
+                if count % 100000 == 0:
+                    self.update_log_signal.emit(f"已读取 {count} 帧原始报文...")
+
+                masked_id = msg.arbitration_id & 0x1FFFFFFF
+                target_id = None
+
+                if msg.arbitration_id in id_to_db_map:
+                    target_id = msg.arbitration_id
+                elif masked_id in id_to_db_map:
+                    target_id = masked_id
+
+                if target_id is not None:
+                    row = {'Timestamp': msg.timestamp}
+                    has_target = False
+
+                    for db_parser, target_sigs in id_to_db_map[target_id]:
+                        try:
+                            decoded = db_parser.decode_message(msg.arbitration_id, msg.data, allow_truncated=True)
+                            for sig_name in target_sigs:
+                                if sig_name in decoded:
+                                    row[sig_name] = decoded[sig_name]
+                                    has_target = True
+                        except Exception:
+                            continue
+
+                    if has_target:
+                        parsed_data.append(row)
+
+            if not parsed_data:
+                self.finished_signal.emit(False, "未找到目标信号！请核对信号名称。")
+                return
+
+            self.update_log_signal.emit("解析完成，正在转换时间戳...")
+            df = pd.DataFrame(parsed_data)
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='s')
+            df.set_index('Timestamp', inplace=True)
+            df.sort_index(inplace=True)
+            df = df.ffill()
+
+            existing_signals = [s for s in self.target_signals if s in df.columns]
+            df = df[existing_signals]
+            # 支持多别名（值现在是列表）
+            rename_map = {}
+            extra_copies = []
+            for eng, aliases in self.signal_map.items():
+                if eng not in df.columns:
+                    continue
+                if aliases:
+                    rename_map[eng] = aliases[0]
+                    for alias in aliases[1:]:
+                        extra_copies.append((aliases[0], alias))
+            
+            df.rename(columns=rename_map, inplace=True)
+            
+            for src_name, new_name in extra_copies:
+                if src_name in df.columns:
+                    df[new_name] = df[src_name]
+
+            before_rows = len(df)
+            complete_rows = df.dropna(how='any')
+
+            if complete_rows.empty:
+                self.finished_signal.emit(False, "所有行都存在缺失值，无法生成有效CSV。请检查BLF起始报文或信号选择。")
+                return
+
+            first_valid_idx = complete_rows.index.min()
+            df = df.loc[first_valid_idx:]
+
+            after_rows = len(df)
+            removed_rows = before_rows - after_rows
+            if removed_rows > 0:
+                self.update_log_signal.emit(f"已删除开头缺失的 {removed_rows} 行，CSV将从第一条完整数据开始。")
+
+            if self.output_mode == 'sec':
+                self.update_log_signal.emit("执行【按秒降频】压缩数据...")
+                df = df.resample('1s').last().ffill()
+            else:
+                self.update_log_signal.emit("保留微秒级高频帧...")
+
+            df.rename(columns=self.signal_map, inplace=True)
+
+            set_col_for_calc = '主驾设定温度'
+            if self.region_mode == 'europe' and '主驾设定温度' in df.columns:
+                self.update_log_signal.emit("🌍 检测为【欧洲车型】，已生成 [+2℃补偿列] 代入计算。")
+                df['对应亚洲设定温度'] = (df['主驾设定温度'] + 2.0).clip(upper=35.0)
+                set_col_for_calc = '对应亚洲设定温度'
+
+            if HAS_SCIPY:
+                pchip = PchipInterpolator([0, 10, 20, 30, 40, 50, 60, 70], self.wind_speeds)
+                if '空调前鼓风机档位' in df.columns:
+                    self.update_log_signal.emit("🌀 使用 PCHIP 生成前排独立 [实际风速] 列...")
+                    df['实际风速'] = pchip(df['空调前鼓风机档位'].fillna(0).clip(0, 70)).clip(min=0)
+                if '空调后鼓风机档位' in df.columns:
+                    self.update_log_signal.emit("🌀 使用 PCHIP 生成后排独立 [后排实际风速] 列...")
+                    valid_rear = df['空调后鼓风机档位'].replace(255, np.nan)
+                    df['后排实际风速'] = pchip(valid_rear.fillna(0).clip(0, 70)).clip(min=0)
+
+            if self.eval_mode == 'comfort':
+                self.update_log_signal.emit("🔥 正在探测并计算动态基准线...")
+                df, calc_msg = calculate_comfort_limits(
+                    df=df,
+                    season=self.season,
+                    target_score=self.target_score,
+                    set_col=set_col_for_calc,
+                    steady_start_idx=self.steady_start_idx,
+                    steady_end_idx=self.steady_end_idx,
+                    log_callback=self.update_log_signal.emit
+                )
+                self.update_log_signal.emit(f"🌟 {calc_msg}")
+
+            if self.output_mode == 'sec':
+                df.index = df.index.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                df.index = [s[:-3] for s in df.index.strftime('%Y-%m-%d %H:%M:%S.%f')]
+
+            self.update_log_signal.emit("正在生成 CSV 文件...")
+            df.to_csv(self.csv_path, index_label="时间(Timestamp)")
+            self.finished_signal.emit(True, f"解析并转换完毕！共生成 {len(df)} 行有效数据。")
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
+
+# ==========================================
+# 线程 2：曲线绘图线程
+# ==========================================
+class PlotThread(QThread):
+    update_log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str, dict)
+
+    def __init__(self, csv_path, template_text, plot_mode, wind_speeds, target_score,
+                 season, region, start_idx, end_idx, steady_start_idx, steady_end_idx):
+        super().__init__()
+        self.csv_path = csv_path
+        self.template_text = template_text
+        self.plot_mode = plot_mode
+        self.wind_speeds = wind_speeds
+        self.target_score = target_score
+        self.season = season
+        self.region = region
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.steady_start_idx = steady_start_idx
+        self.steady_end_idx = steady_end_idx
+
+    def run(self):
+        img_paths_dict = {}
+
+        try:
+            self.update_log_signal.emit(f"正在读取 CSV 源数据: {os.path.basename(self.csv_path)}")
+            df = pd.read_csv(self.csv_path, index_col=0, parse_dates=True)
+
+            # ========== 舒适性 / 采暖模式预处理 ==========
+            if self.plot_mode == 'comfort':
+                self.update_log_signal.emit("🔄 检测到为舒适性报告生成，执行绘图基准线热更新与对齐检查...")
+                set_col_for_calc = '主驾设定温度'
+                if self.region == 'europe':
+                    if '对应亚洲设定温度' not in df.columns and '主驾设定温度' in df.columns:
+                        df['对应亚洲设定温度'] = (df['主驾设定温度'] + 2.0).clip(upper=35.0)
+                    if '对应亚洲设定温度' in df.columns:
+                        set_col_for_calc = '对应亚洲设定温度'
+
+                df, _ = calculate_comfort_limits(
+                    df=df,
+                    season=self.season,
+                    target_score=self.target_score,
+                    set_col=set_col_for_calc,
+                    steady_start_idx=self.steady_start_idx,
+                    steady_end_idx=self.steady_end_idx,
+                    log_callback=self.update_log_signal.emit
+                )
+
+            # 采暖和普通绘图共用区间裁切
+            original_len = len(df)
+            start_i = self.start_idx if self.start_idx is not None else 0
+            end_i = self.end_idx if self.end_idx is not None else original_len
+            start_i = max(0, start_i)
+            end_i = min(original_len, end_i)
+
+            if start_i >= end_i:
+                self.finished_signal.emit(False, "⚠️ 绘图起始行必须小于结束行！", {})
+                return
+
+            if start_i > 0 or end_i < original_len:
+                df_plot = df.iloc[start_i:end_i].copy()
+                self.update_log_signal.emit(f"✂️ 已将画图数据裁切为：第 {start_i + 1} 行 到 第 {end_i} 行。")
+            else:
+                df_plot = df.copy()
+
+            x_axis = range(0, len(df_plot))
+            save_dir = os.path.dirname(self.csv_path)
+            base_name = os.path.splitext(os.path.basename(self.csv_path))[0]
+
+            # ========== 采暖专图生成 ==========
+            if self.plot_mode == 'heating':
+                self.update_log_signal.emit("🔥 开始生成最大采暖评估图表...")
+
+                # 图1：脚部温度趋势
+                plotted_foot = False
+                fig_foot, ax_foot = plt.subplots(figsize=(15, 7))
+                plt.title("最大采暖评估 - 脚部温度趋势", fontweight='bold')
+
+                if '主驾左脚' in df_plot.columns and '主驾右脚' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['主驾左脚'] + df_plot['主驾右脚']) / 2,
+                                 label='主驾脚部均值', linewidth=2)
+                    plotted_foot = True
+                if '副驾左脚' in df_plot.columns and '副驾右脚' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['副驾左脚'] + df_plot['副驾右脚']) / 2,
+                                 label='副驾脚部均值', linewidth=2)
+                if '主驾设定温度' in df_plot.columns:
+                    ax_foot.plot(x_axis, df_plot['主驾设定温度'], '--', label='设定温度', alpha=0.7)
+                if '车外温度' in df_plot.columns:
+                    ax_foot.plot(x_axis, df_plot['车外温度'], ':', label='车外温度', alpha=0.7)
+
+                if plotted_foot:
+                    ax_foot.set_xlabel("数据点序号 (N)")
+                    ax_foot.set_ylabel("温度 (℃)")
+                    ax_foot.grid(True, linestyle='--', alpha=0.7)
+                    ax_foot.margins(x=0)
+                    plt.subplots_adjust(bottom=0.25)
+                    ax_foot.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15),
+                                   fancybox=True, shadow=True, ncol=4)
+                    foot_path = os.path.join(save_dir, f"{base_name}_[Heating]_脚部温度.png")
+                    plt.savefig(foot_path, dpi=120, bbox_inches='tight')
+                    img_paths_dict['img_foot'] = foot_path
+                    self.update_log_signal.emit("✅ 采暖图1：脚部温度已生成！")
+                plt.close(fig_foot)
+
+                # 图2：出风口温度（按信号名中包含 "Vent" 的列绘制）
+                plotted_vent = False
+                fig_vent, ax_vent = plt.subplots(figsize=(15, 7))
+                plt.title("最大采暖 - 出风口温度", fontweight='bold')
+                vent_signals = [c for c in df_plot.columns if 'Vent' in c and 'Temp' in c]
+                for col in vent_signals:
+                    ax_vent.plot(x_axis, df_plot[col], label=col, linewidth=1.5)
+                    plotted_vent = True
+                if plotted_vent:
+                    ax_vent.set_xlabel("数据点序号 (N)")
+                    ax_vent.set_ylabel("温度 (℃)")
+                    ax_vent.grid(True, linestyle='--', alpha=0.7)
+                    ax_vent.margins(x=0)
+                    plt.subplots_adjust(bottom=0.25)
+                    ax_vent.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15),
+                                   fancybox=True, shadow=True, ncol=4)
+                    vent_path = os.path.join(save_dir, f"{base_name}_[Heating]_出风口.png")
+                    plt.savefig(vent_path, dpi=120, bbox_inches='tight')
+                    img_paths_dict['img_vent'] = vent_path
+                    self.update_log_signal.emit("✅ 采暖图2：出风口温度已生成！")
+                plt.close(fig_vent)
+
+                self.finished_signal.emit(True, "🎉 采暖图表生成完毕！", img_paths_dict)
+                return  # 采暖模式到此结束，不再执行常规组图
+
+            # ========== 舒适性专图 ==========
+            if self.plot_mode == 'comfort':
+                self.update_log_signal.emit("\n🚀 开始生成独立舒适性评估图表...")
+
+                face_up_col = next((c for c in df_plot.columns if '分面部上限' in c), None)
+                face_dn_col = next((c for c in df_plot.columns if '分面部下限' in c), None)
+                foot_up_col = next((c for c in df_plot.columns if '分脚部上限' in c), None)
+                foot_dn_col = next((c for c in df_plot.columns if '分脚部下限' in c), None)
+
+                # --- 舒适图1：面部 ---
+                plotted_face = False
+                fig_face, ax_face = plt.subplots(figsize=(15, 7))
+                plt.title("空调舒适性评估 - 面部温度趋势图", fontweight='bold')
+
+                if '主驾左脸' in df_plot.columns and '主驾右脸' in df_plot.columns:
+                    ax_face.plot(x_axis, (df_plot['主驾左脸'] + df_plot['主驾右脸']) / 2, label='主驾面部均值', linewidth=2)
+                    plotted_face = True
+                if '副驾左脸' in df_plot.columns and '副驾右脸' in df_plot.columns:
+                    ax_face.plot(x_axis, (df_plot['副驾左脸'] + df_plot['副驾右脸']) / 2, label='副驾面部均值', linewidth=2)
+                    plotted_face = True
+                if '中排左脸1' in df_plot.columns and '中排左脸2' in df_plot.columns:
+                    ax_face.plot(x_axis, (df_plot['中排左脸1'] + df_plot['中排左脸2']) / 2, label='中排左脸均值', linewidth=1.5)
+                    plotted_face = True
+                if '中排右脸1' in df_plot.columns and '中排右脸2' in df_plot.columns:
+                    ax_face.plot(x_axis, (df_plot['中排右脸1'] + df_plot['中排右脸2']) / 2, label='中排右脸均值', linewidth=1.5)
+                    plotted_face = True
+                if '后排左脸' in df_plot.columns:
+                    ax_face.plot(x_axis, df_plot['后排左脸'], label='后排左脸', linewidth=1.5)
+                if '后排右脸' in df_plot.columns:
+                    ax_face.plot(x_axis, df_plot['后排右脸'], label='后排右脸', linewidth=1.5)
+
+                if plotted_face:
+                    if face_up_col:
+                        ax_face.plot(x_axis, df_plot[face_up_col], color='red', linestyle='-.', linewidth=1.5, label=face_up_col)
+                    else:
+                        ax_face.axhline(y=30, color='red', linestyle='-.', linewidth=1.5, label='上限(默认30℃)')
+
+                    if face_dn_col:
+                        ax_face.plot(x_axis, df_plot[face_dn_col], color='blue', linestyle='-.', linewidth=1.5, label=face_dn_col)
+                    else:
+                        ax_face.axhline(y=20, color='blue', linestyle='-.', linewidth=1.5, label='下限(默认20℃)')
+
+                    ax_face.set_xlabel("数据点序号 (N)")
+                    ax_face.set_ylabel("数值 (℃)")
+                    ax_face.grid(True, linestyle='--', alpha=0.7)
+                    ax_face.margins(x=0)
+
+                    plt.subplots_adjust(bottom=0.25)
+                    ax_face.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), fancybox=True, shadow=True, ncol=4)
+
+                    face_path = os.path.join(save_dir, f"{base_name}_[评估]_舒适性01-面部.png")
+                    plt.savefig(face_path, dpi=120, bbox_inches='tight')
+                    img_paths_dict['img_face'] = face_path
+                    self.update_log_signal.emit("✅ 舒适性专图 1：面部评估基准线图已生成！")
+                plt.close(fig_face)
+
+                # --- 舒适图2：脚部 ---
+                plotted_foot = False
+                fig_foot, ax_foot = plt.subplots(figsize=(15, 7))
+                plt.title("空调舒适性评估 - 脚部温度趋势图", fontweight='bold')
+
+                if '主驾左脚' in df_plot.columns and '主驾右脚' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['主驾左脚'] + df_plot['主驾右脚']) / 2, label='主驾脚部均值', linewidth=2)
+                    plotted_foot = True
+                if '副驾左脚' in df_plot.columns and '副驾右脚' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['副驾左脚'] + df_plot['副驾右脚']) / 2, label='副驾脚部均值', linewidth=2)
+                    plotted_foot = True
+                if '中排左脚1' in df_plot.columns and '中排左脚2' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['中排左脚1'] + df_plot['中排左脚2']) / 2, label='中排左脚均值', linewidth=1.5)
+                    plotted_foot = True
+                if '中排右脚1' in df_plot.columns and '中排右脚2' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['中排右脚1'] + df_plot['中排右脚2']) / 2, label='中排右脚均值', linewidth=1.5)
+                    plotted_foot = True
+                if '后排左脚1' in df_plot.columns and '后排左脚2' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['后排左脚1'] + df_plot['后排左脚2']) / 2, label='后排左脚均值', linewidth=1.5)
+                    plotted_foot = True
+                if '后排右脚1' in df_plot.columns and '后排右脚2' in df_plot.columns:
+                    ax_foot.plot(x_axis, (df_plot['后排右脚1'] + df_plot['后排右脚2']) / 2, label='后排右脚均值', linewidth=1.5)
+                    plotted_foot = True
+
+                if plotted_foot:
+                    if foot_up_col:
+                        ax_foot.plot(x_axis, df_plot[foot_up_col], color='red', linestyle='-.', linewidth=1.5, label=foot_up_col)
+                    else:
+                        ax_foot.axhline(y=30, color='red', linestyle='-.', linewidth=1.5, label='上限(默认30℃)')
+
+                    if foot_dn_col:
+                        ax_foot.plot(x_axis, df_plot[foot_dn_col], color='blue', linestyle='-.', linewidth=1.5, label=foot_dn_col)
+                    else:
+                        ax_foot.axhline(y=20, color='blue', linestyle='-.', linewidth=1.5, label='下限(默认20℃)')
+
+                    ax_foot.set_xlabel("数据点序号 (N)")
+                    ax_foot.set_ylabel("数值 (℃)")
+                    ax_foot.grid(True, linestyle='--', alpha=0.7)
+                    ax_foot.margins(x=0)
+
+                    plt.subplots_adjust(bottom=0.25)
+                    ax_foot.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), fancybox=True, shadow=True, ncol=4)
+
+                    foot_path = os.path.join(save_dir, f"{base_name}_[评估]_舒适性02-脚部.png")
+                    plt.savefig(foot_path, dpi=120, bbox_inches='tight')
+                    img_paths_dict['img_foot'] = foot_path
+                    self.update_log_signal.emit("✅ 舒适性专图 2：脚部评估基准线图已生成！")
+                plt.close(fig_foot)
+
+                self.finished_signal.emit(True, "\n🎉 恭喜，所有舒适性图式生成完毕！", img_paths_dict)
+                return
+
+            # ========== 常规组图 ==========
+            groups = []
+            current_group = []
+            for line in self.template_text.split('\n'):
+                line = line.strip()
+                if not line:
+                    if current_group:
+                        groups.append(current_group)
+                        current_group = []
+                else:
+                    if ':' in line:
+                        col_name = line.split(':', 1)[1].strip()
+                    elif '：' in line:
+                        col_name = line.split('：', 1)[1].strip()
+                    else:
+                        col_name = line.strip()
+                    current_group.append(col_name)
+            if current_group:
+                groups.append(current_group)
+
+            if not groups:
+                self.finished_signal.emit(False, "绘图组拆解为空，请检查绘图模板格式", {})
+                return
+
+            self.update_log_signal.emit(f"\n📏 开始处理 {len(groups)} 个常规图块...")
+
+            for i, group in enumerate(groups):
+                valid_cols = [col for col in group if col in df_plot.columns]
+                if not valid_cols:
+                    self.update_log_signal.emit(f"⚠️ 警告：模板第 {i + 1} 块信号未找到，已跳过。")
+                    continue
+
+                if '空调前鼓风机档位' in valid_cols and '空调后鼓风机档位' in valid_cols:
+                    if (df_plot['空调后鼓风机档位'] == 255).any():
+                        valid_cols.remove('空调后鼓风机档位')
+                        self.update_log_signal.emit("   -> 侦测到后风机存在 255 无效值，已从当前图中剔除后风机。")
+
+                fig, ax = plt.subplots(figsize=(15, 7))
+                plt.title(f"数据走势图 - 组 {i + 1}", fontweight='bold')
+
+                ax_right = None
+                ax_wind = None
+
+                for col in valid_cols:
+                    if col in ['压缩机出口压力', '左侧阳光', '右侧阳光', '左侧阳光值', '右侧阳光值']:
+                        if ax_right is None:
+                            ax_right = ax.twinx()
+                        ax_right.plot(x_axis, df_plot[col], label=f"{col} (右轴)", linewidth=1.5, linestyle='--')
+                    else:
+                        ax.plot(x_axis, df_plot[col], label=col, linewidth=1.5)
+
+                ax.set_xlabel("数据点序号 (N)")
+                ax.set_ylabel("常规数值")
+                ax.grid(True, linestyle='--', alpha=0.7)
+                ax.margins(x=0)
+
+                if '空调前鼓风机档位' in valid_cols:
+                    ax.set_ylim(-5, 75)
+                    ax_wind = ax.twinx()
+
+                    if HAS_SCIPY:
+                        pchip = PchipInterpolator([0, 10, 20, 30, 40, 50, 60, 70], self.wind_speeds)
+                        max_w = float(pchip(70))
+                        ax_wind.set_ylim(-0.2, max_w + 1.5)
+                        ax_wind.set_ylabel("实际风速 (m/s)", color="purple", fontweight='bold')
+                        ax_wind.axhline(y=4.6, color='red', linestyle=':', linewidth=2, label="最大风速要求 (4.6m/s)")
+
+                        if '实际风速' in df_plot.columns:
+                            ax_wind.plot(x_axis, df_plot['实际风速'], color='purple', linestyle='-', linewidth=2.5, alpha=0.8, label='前排实际风速')
+
+                        if '空调后鼓风机档位' in valid_cols and '后排实际风速' in df_plot.columns:
+                            ax_wind.plot(x_axis, df_plot['后排实际风速'], color='saddlebrown', linestyle='-.', linewidth=2.5, alpha=0.8, label='后排实际风速')
+
+                    if ax_right is not None:
+                        ax_wind.spines['right'].set_position(('outward', 65))
+
+                if ax_right is not None:
+                    if '压缩机出口压力' in valid_cols:
+                        ax_right.set_ylabel("压力数值", color="green")
+                    else:
+                        ax_right.set_ylabel("阳光辐射", color="green")
+
+                plt.subplots_adjust(bottom=0.25)
+                handles, labels = ax.get_legend_handles_labels()
+
+                if ax_right is not None:
+                    h2, l2 = ax_right.get_legend_handles_labels()
+                    handles.extend(h2)
+                    labels.extend(l2)
+
+                if ax_wind is not None:
+                    h3, l3 = ax_wind.get_legend_handles_labels()
+                    handles.extend(h3)
+                    labels.extend(l3)
+
+                ax.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15),
+                          fancybox=True, shadow=True, ncol=4)
+
+                first_sig_name = valid_cols[0].replace('/', '_').replace('\\', '_').replace(':', '_')
+                img_name = f"{base_name}_Plot_组{i + 1}_{first_sig_name}.png"
+                img_path = os.path.join(save_dir, img_name)
+
+                plt.savefig(img_path, dpi=120, bbox_inches='tight')
+                plt.close(fig)
+
+                img_paths_dict[f'img{i + 1}'] = img_path
+                self.update_log_signal.emit(f"✅ 常规图 {i + 1} 生成成功！")
+
+            self.finished_signal.emit(True, "\n🎉 恭喜，所有常规图式生成完毕！", img_paths_dict)
+
+        except Exception as e:
+            self.finished_signal.emit(False, f"绘图失败: {str(e)}", {})
+
+
+# ==========================================
+# 主界面 GUI
+# ==========================================
+class AppWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMinimumSize(850, 750)
+        self.setMouseTracking(True)
+
+        self.dbc_files = []
+        self.pending_plot_mode = 'none'
+        self.settings = QSettings("MyCompany", "CanDataParser_HVAC_V86")
+
+        self._drag_pos = None
+        self._is_resizing = False
+        self._is_moving = False
+        self._resize_dir = None
+        self._margin = 8
+
+        self.initUI()
+        self.load_settings()
+
+    def initUI(self):
+        self.setWindowTitle('CAN总线数据全自动分析工作站 V1.2.1')
+        self.resize(900, 1020)
+
+        self.outer_layout = QVBoxLayout(self)
+        self.outer_layout.setContentsMargins(self._margin, self._margin, self._margin, self._margin)
+        self.outer_layout.setSpacing(0)
+
+        self.bg_widget = QWidget()
+        self.bg_widget.setObjectName("bg_widget")
+        self.bg_widget.setMouseTracking(True)
+        self.bg_widget.setStyleSheet("""
+            QWidget#bg_widget {
+                background-color: #FFFFFF;
+                border-radius: 15px;
+                border: 1px solid #B0BEC5;
+            }
+        """)
+        self.outer_layout.addWidget(self.bg_widget)
+
+        content_layout = QVBoxLayout(self.bg_widget)
+        content_layout.setContentsMargins(15, 10, 15, 15)
+        content_layout.setSpacing(8)
+
+        # 标题栏
+        self.title_bar = QWidget()
+        self.title_bar.setFixedHeight(42)
+        self.title_bar.setMouseTracking(True)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.title_label = QLabel('🚗 CAN总线数据全自动分析工作站 V1.2.1')
+        self.title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2C3E50;")
+
+        self.btn_min = QPushButton("一")
+        self.btn_min.setFixedSize(30, 30)
+        self.btn_min.setCursor(Qt.ArrowCursor)
+        self.btn_min.setStyleSheet("""
+            QPushButton { border-radius: 15px; background-color: #E0E0E0; font-weight: bold; border: none; }
+            QPushButton:hover { background-color: #BDBDBD; }
+        """)
+        self.btn_min.clicked.connect(self.showMinimized)
+
+        self.btn_close = QPushButton("✖")
+        self.btn_close.setFixedSize(30, 30)
+        self.btn_close.setCursor(Qt.ArrowCursor)
+        self.btn_close.setStyleSheet("""
+            QPushButton { border-radius: 15px; background-color: #FF5252; color: white; font-weight: bold; border: none; }
+            QPushButton:hover { background-color: #FF1744; }
+        """)
+        self.btn_close.clicked.connect(self.close)
+
+        title_layout.addWidget(self.title_label)
+        title_layout.addStretch()
+        title_layout.addWidget(self.btn_min)
+        title_layout.addWidget(self.btn_close)
+        content_layout.addWidget(self.title_bar)
+        content_layout.addWidget(QLabel(""))
+
+        # 选项卡
+        self.tabs = QTabWidget()
+        self.tab_extract = QWidget()
+        self.tab_plot = QWidget()
+        self.tabs.addTab(self.tab_extract, "🛠️ 提取转换 (BLF -> CSV)")
+        self.tabs.addTab(self.tab_plot, "📈 曲线绘制及 Word 自动报告生成")
+
+        self.init_extract_tab()
+        self.init_plot_tab()
+        content_layout.addWidget(self.tabs)
+
+    # 标题栏与拉伸事件（保持不变）
+    def _get_resize_region(self, pos):
+        x, y = pos.x(), pos.y()
+        w, h = self.width(), self.height()
+        m = self._margin + 5
+        region = ""
+        if y < m: region += "top"
+        elif y > h - m: region += "bottom"
+        if x < m: region += "left"
+        elif x > w - m: region += "right"
+        return region
+
+    def _title_bar_rect_in_window(self):
+        return self.title_bar.geometry().translated(self.bg_widget.pos())
+
+    def _is_over_title_bar_buttons(self, pos):
+        child = self.childAt(pos)
+        while child is not None:
+            if child in (self.btn_min, self.btn_close):
+                return True
+            child = child.parentWidget()
+        return False
+
+    def _is_in_draggable_title_bar(self, pos):
+        return self._title_bar_rect_in_window().contains(pos) and not self._is_over_title_bar_buttons(pos)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            region = self._get_resize_region(event.pos())
+            if region:
+                self._is_resizing = True
+                self._resize_dir = region
+                event.accept()
+                return
+            if self._is_in_draggable_title_bar(event.pos()):
+                self._is_moving = True
+                self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_resizing:
+            global_pos = event.globalPos()
+            rect = self.geometry()
+            if "left" in self._resize_dir: rect.setLeft(global_pos.x())
+            if "right" in self._resize_dir: rect.setRight(global_pos.x())
+            if "top" in self._resize_dir: rect.setTop(global_pos.y())
+            if "bottom" in self._resize_dir: rect.setBottom(global_pos.y())
+            if rect.width() >= self.minimumWidth() and rect.height() >= self.minimumHeight():
+                self.setGeometry(rect)
+            event.accept()
+            return
+        if self._is_moving and self._drag_pos is not None:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+            return
+        region = self._get_resize_region(event.pos())
+        if region in ["topleft", "bottomright"]: self.setCursor(Qt.SizeFDiagCursor)
+        elif region in ["topright", "bottomleft"]: self.setCursor(Qt.SizeBDiagCursor)
+        elif region in ["left", "right"]: self.setCursor(Qt.SizeHorCursor)
+        elif region in ["top", "bottom"]: self.setCursor(Qt.SizeVerCursor)
+        else: self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._is_resizing = False
+        self._is_moving = False
+        self._resize_dir = None
+        self._drag_pos = None
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    # ================= 第1页 =================
+    def init_extract_tab(self):
+        layout = QVBoxLayout()
+
+        guide_layout = QHBoxLayout()
+        guide_layout.addStretch()
+        self.btn_guide = QPushButton("📖 使用指南")
+        self.btn_guide.setStyleSheet("""
+            QPushButton {
+                background-color: #FFC107; color: #424242; font-weight: bold;
+                padding: 6px 15px; border-radius: 4px; border: 1px solid #FFA000;
+            }
+            QPushButton:hover { background-color: #FFD54F; }
+        """)
+        self.btn_guide.clicked.connect(self.show_guide)
+        guide_layout.addWidget(self.btn_guide)
+        layout.addLayout(guide_layout)
+
+        layout.addWidget(QLabel("1. 选择 BLF 文件:"))
+        blf_layout = QHBoxLayout()
+        self.blf_input = QLineEdit()
+        btn_blf = QPushButton("浏览...")
+        btn_blf.clicked.connect(self.browse_blf)
+        blf_layout.addWidget(self.blf_input)
+        blf_layout.addWidget(btn_blf)
+        layout.addLayout(blf_layout)
+
+        layout.addWidget(QLabel("\n2. 添加 DBC 数据库文件:"))
+        dbc_layout = QHBoxLayout()
+        self.dbc_listWidget = QListWidget()
+        self.dbc_listWidget.setFixedHeight(120)
+        dbc_btn_vbox = QVBoxLayout()
+        btn_add_dbc = QPushButton("➕ 添加 DBC")
+        btn_remove_dbc = QPushButton("➖ 移除选中")
+        btn_clear_dbc = QPushButton("🗑️ 清空列表")
+        btn_view_dbc = QPushButton("🔍 导出所有信号名")
+        btn_view_dbc.setStyleSheet("color: #FF5722; font-weight: bold;")
+        btn_add_dbc.clicked.connect(self.add_dbc)
+        btn_remove_dbc.clicked.connect(self.remove_dbc)
+        btn_clear_dbc.clicked.connect(self.clear_dbc)
+        btn_view_dbc.clicked.connect(self.view_dbc_signals)
+        dbc_btn_vbox.addWidget(btn_add_dbc)
+        dbc_btn_vbox.addWidget(btn_remove_dbc)
+        dbc_btn_vbox.addWidget(btn_clear_dbc)
+        dbc_btn_vbox.addWidget(btn_view_dbc)
+        dbc_layout.addWidget(self.dbc_listWidget)
+        dbc_layout.addLayout(dbc_btn_vbox)
+        layout.addLayout(dbc_layout)
+
+        sig_header_layout = QHBoxLayout()
+        sig_header_layout.addWidget(QLabel("\n3. 核心目标信号列表:"))
+        btn_sensor_dlg = QPushButton("🎛️ 座舱温度传感器快速映射面板")
+        btn_sensor_dlg.setStyleSheet("background-color: #E0F7FA; color: #00838F; font-weight: bold; padding: 6px; border-radius: 4px;")
+        btn_sensor_dlg.clicked.connect(self.open_sensor_mapping_dialog)
+        btn_load_tpl = QPushButton("📂 加载txt配置模板")
+        btn_load_tpl.clicked.connect(self.load_template)
+        sig_header_layout.addStretch()
+        sig_header_layout.addWidget(btn_sensor_dlg)
+        sig_header_layout.addWidget(btn_load_tpl)
+        layout.addLayout(sig_header_layout)
+
+        self.signal_input = QTextEdit()
+        self.signal_input.setPlaceholderText("格式示例：\n英文原始信号名 : 中文别名\n\n例如：\nxxx_id : 车外温度\nxxx_id : 主驾设定温度\nxxx_id : 空调前鼓风机档位")
+        layout.addWidget(self.signal_input)
+
+        layout.addWidget(QLabel("\n4. 核心设置 (计算模式定义):"))
+        settings_layout = QHBoxLayout()
+        self.radio_sec = QRadioButton("按秒记录")
+        self.radio_all = QRadioButton("极速原帧")
+        self.radio_sec.setChecked(True)
+        self.mode_group = QButtonGroup()
+        self.mode_group.addButton(self.radio_sec)
+        self.mode_group.addButton(self.radio_all)
+
+        self.season_combo = QComboBox()
+        self.season_combo.addItems(["summer (夏季表)", "winter (冬季表)"])
+
+        self.score_combo = QComboBox()
+        self.score_combo.addItems(["6.0分标准", "6.5分标准(默认)", "7.0分标准"])
+        self.score_combo.setCurrentIndex(1)
+        self.score_combo.setStyleSheet("color: #E91E63; font-weight: bold; border: 1px solid #E91E63;")
+
+        self.region_combo = QComboBox()
+        self.region_combo.addItems(["亚洲车型 (标准企标)", "欧洲车型 (平移企标)"])
+        self.region_combo.setStyleSheet("color: #004D40; font-weight: bold;")
+
+        self.btn_wind_calib = QPushButton("🌀 风量挡位拟合")
+        self.btn_wind_calib.setStyleSheet("background-color: #009688; color: white;")
+        self.btn_wind_calib.clicked.connect(self.open_wind_calibration)
+
+        settings_layout.addWidget(self.radio_sec)
+        settings_layout.addWidget(self.radio_all)
+        settings_layout.addWidget(self.season_combo)
+        settings_layout.addWidget(self.score_combo)
+        settings_layout.addWidget(self.region_combo)
+        settings_layout.addStretch()
+        settings_layout.addWidget(self.btn_wind_calib)
+        layout.addLayout(settings_layout)
+
+        layout.addWidget(QLabel("\n5. 保存 CSV 路径:"))
+        csv_layout = QHBoxLayout()
+        self.csv_input = QLineEdit()
+        btn_csv = QPushButton("另存为...")
+        btn_csv.clicked.connect(self.browse_csv)
+        csv_layout.addWidget(self.csv_input)
+        csv_layout.addWidget(btn_csv)
+        layout.addLayout(csv_layout)
+
+        layout.addWidget(QLabel(""))
+        btn_action_layout = QHBoxLayout()
+
+        self.btn_ext_only = QPushButton("⬇️ 仅提取CSV")
+        self.btn_ext_only.setStyleSheet("""
+            QPushButton { background-color: #00BCD4; color: white; font-weight: bold; height: 45px; border-radius: 6px; }
+            QPushButton:hover { background-color: #26C6DA; }
+        """)
+        self.btn_ext_norm = QPushButton("🚀 一键绘图 (常规)")
+        self.btn_ext_norm.setStyleSheet("""
+            QPushButton { background-color: #2196F3; color: white; font-weight: bold; height: 45px; border-radius: 6px; }
+            QPushButton:hover { background-color: #42A5F5; }
+        """)
+        self.btn_ext_comfort = QPushButton("🔥 一键提取 (空调舒适性报告)")
+        self.btn_ext_comfort.setStyleSheet("""
+            QPushButton { background-color: #7E57C2; color: white; font-weight: bold; height: 45px; border-radius: 6px; }
+            QPushButton:hover { background-color: #9575CD; }
+        """)
+
+        self.btn_ext_only.clicked.connect(lambda: self.start_extract(mode='none'))
+        self.btn_ext_norm.clicked.connect(lambda: self.start_extract(mode='normal'))
+        self.btn_ext_comfort.clicked.connect(lambda: self.start_extract(mode='comfort'))
+
+        btn_action_layout.addWidget(self.btn_ext_only)
+        btn_action_layout.addWidget(self.btn_ext_norm)
+        btn_action_layout.addWidget(self.btn_ext_comfort)
+        layout.addLayout(btn_action_layout)
+
+        self.log_output_ext = QTextEdit()
+        self.log_output_ext.setReadOnly(True)
+        self.log_output_ext.setStyleSheet("background-color: #f8f9fa; border: 1px solid #ccc;")
+        layout.addWidget(self.log_output_ext)
+
+        self.tab_extract.setLayout(layout)
+
+    # ================= 第2页 =================
+    def init_plot_tab(self):
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("\n1. 绘图与报告数据源 (CSV文件):"))
+        src_layout = QHBoxLayout()
+        self.plot_csv_input = QLineEdit()
+        btn_plot_src = QPushButton("浏览...")
+        btn_plot_src.clicked.connect(self.browse_plot_csv)
+        src_layout.addWidget(self.plot_csv_input)
+        src_layout.addWidget(btn_plot_src)
+        layout.addLayout(src_layout)
+
+        # 生成风速列按钮
+        wind_gen_layout = QHBoxLayout()
+        wind_gen_layout.addWidget(QLabel("💡 若CSV中缺少实际风速列，可基于当前标定值补充："))
+        self.btn_gen_wind_col = QPushButton("💨 生成实际风速列")
+        self.btn_gen_wind_col.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800; color: white; font-weight: bold;
+                padding: 6px 15px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #FFB74D; }
+        """)
+        self.btn_gen_wind_col.clicked.connect(self.generate_wind_column)
+        wind_gen_layout.addWidget(self.btn_gen_wind_col)
+        wind_gen_layout.addStretch()
+        layout.addLayout(wind_gen_layout)
+
+        layout.addWidget(QLabel("\n2. [绘图控制] 指定绘图生成区间:"))
+        range_layout = QHBoxLayout()
+        self.range_start_input = QLineEdit()
+        self.range_start_input.setPlaceholderText("起始行(含)，留空表示从头开始")
+        self.range_end_input = QLineEdit()
+        self.range_end_input.setPlaceholderText("结束行(不含)，留空表示到末尾")
+        range_layout.addWidget(QLabel("起始行:"))
+        range_layout.addWidget(self.range_start_input)
+        range_layout.addWidget(QLabel("结束行:"))
+        range_layout.addWidget(self.range_end_input)
+        range_layout.addStretch()
+        layout.addLayout(range_layout)
+
+        layout.addWidget(QLabel("3. [稳态控制] 指定稳态判定区间:"))
+        steady_layout = QHBoxLayout()
+        self.steady_start_input = QLineEdit()
+        self.steady_start_input.setPlaceholderText("留空则按默认稳态判定逻辑")
+        self.steady_end_input = QLineEdit()
+        self.steady_end_input.setPlaceholderText("留空则到末尾")
+        steady_layout.addWidget(QLabel("稳态起:"))
+        steady_layout.addWidget(self.steady_start_input)
+        steady_layout.addWidget(QLabel("稳态止:"))
+        steady_layout.addWidget(self.steady_end_input)
+        steady_layout.addStretch()
+        layout.addLayout(steady_layout)
+
+        layout.addWidget(QLabel("\n4. Word 全自动报告配置:"))
+        tpl_layout = QHBoxLayout()
+        self.word_tpl_input = QLineEdit()
+        btn_tpl = QPushButton("浏览模板...")
+        btn_tpl.clicked.connect(self.browse_tpl)
+        tpl_layout.addWidget(self.word_tpl_input)
+        tpl_layout.addWidget(btn_tpl)
+        layout.addLayout(tpl_layout)
+
+        out_layout = QHBoxLayout()
+        self.word_out_input = QLineEdit()
+        btn_out = QPushButton("另存 Word...")
+        btn_out.clicked.connect(self.browse_out)
+        out_layout.addWidget(self.word_out_input)
+        out_layout.addWidget(btn_out)
+        layout.addLayout(out_layout)
+
+        layout.addWidget(QLabel("\n5. 绘图分组规则:"))
+        self.plot_template_input = QTextEdit()
+        layout.addWidget(self.plot_template_input)
+
+        btn_sync = QPushButton("🔄 点击同步并应用最新提取配置")
+        btn_sync.clicked.connect(self.sync_template)
+        layout.addWidget(btn_sync)
+
+        btn_layout = QHBoxLayout()
+
+        self.btn_plot_normal = QPushButton("📊 自动生成 (标准图表)")
+        self.btn_plot_normal.setStyleSheet("""
+            QPushButton { background-color: #2196F3; color: white; font-weight: bold; height: 45px; border-radius: 6px; }
+            QPushButton:hover { background-color: #42A5F5; }
+        """)
+
+        self.btn_plot_comfort = QPushButton("🌡️ 自动生成 (舒适性图表 + Word)")
+        self.btn_plot_comfort.setStyleSheet("""
+            QPushButton { background-color: #E91E63; color: white; font-weight: bold; height: 45px; border-radius: 6px; }
+            QPushButton:hover { background-color: #F06292; }
+        """)
+
+        self.btn_plot_heating = QPushButton("🔥 最大采暖报告")
+        self.btn_plot_heating.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5722; color: white; font-weight: bold;
+                height: 45px; border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #FF7043; }
+        """)
+
+        self.btn_open_img_folder = QPushButton("📂 查看存储目录")
+        self.btn_open_img_folder.setStyleSheet("height: 45px; border-radius: 6px;")
+        self.btn_open_img_folder.clicked.connect(self.open_plot_folder)
+
+        self.btn_plot_normal.clicked.connect(lambda: self.start_plot(mode='normal'))
+        self.btn_plot_comfort.clicked.connect(lambda: self.start_plot(mode='comfort'))
+        self.btn_plot_heating.clicked.connect(lambda: self.start_plot(mode='heating'))
+
+        btn_layout.addWidget(self.btn_plot_normal)
+        btn_layout.addWidget(self.btn_plot_comfort)
+        btn_layout.addWidget(self.btn_plot_heating)
+        btn_layout.addWidget(self.btn_open_img_folder)
+        layout.addLayout(btn_layout)
+
+        self.log_output_plot = QTextEdit()
+        self.log_output_plot.setReadOnly(True)
+        self.log_output_plot.setStyleSheet("background-color: #f8f9fa; border: 1px solid #ccc;")
+        layout.addWidget(self.log_output_plot)
+
+        self.tab_plot.setLayout(layout)
+
+    # ================= 通用业务方法 =================
+    def open_sensor_mapping_dialog(self):
+        dlg = SensorMappingDialog(self)
+        dlg.exec_()
+
+    def show_guide(self):
+        if hasattr(self, 'guide_dialog') and self.guide_dialog is not None:
+            self.guide_dialog.show()
+            self.guide_dialog.raise_()
+            self.guide_dialog.activateWindow()
+            return
+        self.guide_dialog = GuideDialog(self)
+        self.guide_dialog.setModal(False)
+        self.guide_dialog.setWindowModality(Qt.NonModal)
+        self.guide_dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.guide_dialog.destroyed.connect(lambda: setattr(self, 'guide_dialog', None))
+        self.guide_dialog.show()
+        self.guide_dialog.raise_()
+        self.guide_dialog.activateWindow()
+
+    def open_wind_calibration(self):
+        dlg = WindCalibrationDialog(self, self.settings)
+        dlg.exec_()
+
+    def browse_blf(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择 BLF", "", "BLF (*.blf)")
+        if f: self.blf_input.setText(f)
+
+    def add_dbc(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "选择 DBC", "", "DBC (*.dbc)")
+        for f in fs:
+            if f not in self.dbc_files:
+                self.dbc_files.append(f)
+                self.dbc_listWidget.addItem(os.path.basename(f))
+
+    def remove_dbc(self):
+        row = self.dbc_listWidget.currentRow()
+        if row >= 0:
+            self.dbc_listWidget.takeItem(row)
+            self.dbc_files.pop(row)
+
+    def clear_dbc(self):
+        self.dbc_files.clear()
+        self.dbc_listWidget.clear()
+
+    def browse_csv(self):
+        f, _ = QFileDialog.getSaveFileName(self, "保存 CSV", "output.csv", "CSV (*.csv)")
+        if f: self.csv_input.setText(f)
+
+    def browse_plot_csv(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择 CSV", "", "CSV (*.csv)")
+        if f: self.plot_csv_input.setText(f)
+
+    def browse_tpl(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择 Word 模板", "", "Word (*.docx)")
+        if f: self.word_tpl_input.setText(f)
+
+    def browse_out(self):
+        f, _ = QFileDialog.getSaveFileName(self, "保存计算报告", "最终评测报告.docx", "Word (*.docx)")
+        if f: self.word_out_input.setText(f)
+
+    def load_template(self):
+        f, _ = QFileDialog.getOpenFileName(self, "选择 txt 模板", "", "Text Files (*.txt)")
+        if f:
+            with open(f, 'r', encoding='utf-8') as file:
+                self.signal_input.setPlainText(file.read())
+
+    def sync_template(self):
+        self.plot_template_input.setPlainText(self.signal_input.toPlainText())
+
+    def open_plot_folder(self):
+        path = self.plot_csv_input.text()
+        folder = os.path.dirname(path) if path and os.path.exists(os.path.dirname(path)) else os.getcwd()
+        if sys.platform == 'win32':
+            os.startfile(folder)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', folder])
+        else:
+            subprocess.Popen(['xdg-open', folder])
+
+    def view_dbc_signals(self):
+        if not self.dbc_files:
+            QMessageBox.warning(self, "提示", "请先添加至少一个 DBC！")
+            return
+        self.log_output_ext.append("正在后台拆解 DBC...")
+        QApplication.processEvents()
+        signal_info_list = []
+        for dbc_path in self.dbc_files:
+            dbc_name = os.path.basename(dbc_path)
+            temp_db = cantools.database.Database(strict=False)
+            try:
+                try:
+                    with open(dbc_path, 'r', encoding='gbk') as f:
+                        temp_db.add_dbc_string(f.read())
+                except Exception:
+                    with open(dbc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        temp_db.add_dbc_string(f.read())
+                for msg in temp_db.messages:
+                    for sig in msg.signals:
+                        comment = str(sig.comment if sig.comment else "无").replace('\n', ' ')
+                        signal_info_list.append(f"{sig.name}  [来源: {dbc_name} | {msg.name}]  --- 注释: {comment}")
+            except Exception:
+                continue
+        signal_info_list = sorted(list(set(signal_info_list)))
+        temp_txt_path = os.path.join(os.getcwd(), "DBC_所有可用信号清单.txt")
+        with open(temp_txt_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(signal_info_list))
+        if sys.platform == 'win32':
+            os.startfile(temp_txt_path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', temp_txt_path])
+        else:
+            subprocess.Popen(['xdg-open', temp_txt_path])
+
+    def get_user_steady_idx(self):
+        try:
+            start_str = self.steady_start_input.text().strip()
+            end_str = self.steady_end_input.text().strip()
+            return int(start_str) - 1 if start_str else None, int(end_str) if end_str else None
+        except ValueError:
+            return None, None
+
+    def get_user_plot_range_idx(self):
+        try:
+            start_str = self.range_start_input.text().strip()
+            end_str = self.range_end_input.text().strip()
+            return int(start_str) - 1 if start_str else None, int(end_str) if end_str else None
+        except ValueError:
+            return None, None
+
+    def generate_wind_column(self):
+        csv_path = self.plot_csv_input.text().strip()
+        if not csv_path or not os.path.exists(csv_path):
+            QMessageBox.warning(self, "错误", "请先选择有效的 CSV 文件！")
+            return
+        if not HAS_SCIPY:
+            QMessageBox.critical(self, "缺少依赖", "该功能需要 scipy 库，请先安装：pip install scipy")
+            return
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            QMessageBox.critical(self, "读取失败", f"无法读取 CSV：{str(e)}")
+            return
+        front_exist = '空调前鼓风机档位' in df.columns
+        rear_exist = '空调后鼓风机档位' in df.columns
+        if not front_exist and not rear_exist:
+            QMessageBox.information(self, "无需操作", "CSV 中未找到相关鼓风机档位列。")
+            return
+        reply = QMessageBox.question(self, "确认修改",
+                                     f"即将在以下文件中添加/覆盖风速列：\n{csv_path}\n\n此操作会直接修改原文件，是否继续？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        wind_speeds = [0.0]
+        for lvl in range(10, 80, 10):
+            wind_speeds.append(self.settings.value(f"wind_speed_{lvl}", lvl / 10.0, type=float))
+        from scipy.interpolate import PchipInterpolator
+        pchip = PchipInterpolator([0, 10, 20, 30, 40, 50, 60, 70], wind_speeds)
+        if front_exist:
+            gear = df['空调前鼓风机档位'].fillna(0).clip(0, 70)
+            df['实际风速'] = pchip(gear).clip(min=0)
+            self.log_output_plot.append("✅ 已为 CSV 添加【实际风速】列（前排）。")
+        if rear_exist:
+            rear_gear = df['空调后鼓风机档位'].replace(255, np.nan).fillna(0).clip(0, 70)
+            df['后排实际风速'] = pchip(rear_gear).clip(min=0)
+            self.log_output_plot.append("✅ 已为 CSV 添加【后排实际风速】列。")
+        try:
+            df.to_csv(csv_path, index=False)
+            self.log_output_plot.append(f"💾 风速列已保存至原文件：{csv_path}")
+            QMessageBox.information(self, "完成", "实际风速列已成功添加到 CSV 文件中。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"写入文件出错：{str(e)}")
+
+    # ================= 第1页：提取 =================
+    def start_extract(self, mode='none'):
+        self.pending_plot_mode = mode
+        blf = self.blf_input.text()
+        csv = self.csv_input.text()
+        sig_text = self.signal_input.toPlainText().strip()
+        if not (blf and self.dbc_files and sig_text and csv):
+            QMessageBox.warning(self, "提示", "提取核心配置未填妥，请检查必填项目")
+            return
+
+        mapping = {}
+        for line in sig_text.split('\n'):
+            line = line.strip()
+            if not line: continue
+            if ':' in line: parts = line.split(':', 1)
+            elif '：' in line: parts = line.split('：', 1)
+            else: parts = [line, line]
+            eng = parts[0].strip()
+            chi = parts[1].strip()
+            if not chi: chi = eng
+            if eng not in mapping: mapping[eng] = []
+            if chi not in mapping[eng]: mapping[eng].append(chi)
+
+        wind_speeds = [0.0]
+        for lvl in range(10, 80, 10):
+            wind_speeds.append(self.settings.value(f"wind_speed_{lvl}", lvl / 10.0, type=float))
+
+        self.btn_ext_only.setEnabled(False)
+        self.btn_ext_norm.setEnabled(False)
+        self.btn_ext_comfort.setEnabled(False)
+        self.log_output_ext.clear()
+
+        run_mode = "sec" if self.radio_sec.isChecked() else "all"
+        season_mode = "summer" if "夏季" in self.season_combo.currentText() else "winter"
+        region_mode = "europe" if "欧洲" in self.region_combo.currentText() else "asia"
+
+        score_txt = self.score_combo.currentText()
+        if "6.0" in score_txt: target_score = 6.0
+        elif "7.0" in score_txt: target_score = 7.0
+        else: target_score = 6.5
+
+        steady_start_idx, steady_end_idx = self.get_user_steady_idx()
+
+        self.ext_thread = ConversionThread(
+            blf_path=blf, dbc_paths=self.dbc_files, signal_map=mapping,
+            csv_path=csv, output_mode=run_mode, eval_mode=mode,
+            season=season_mode, region_mode=region_mode,
+            wind_speeds=wind_speeds, target_score=target_score,
+            steady_start_idx=steady_start_idx, steady_end_idx=steady_end_idx
+        )
+        self.ext_thread.update_log_signal.connect(lambda t: self.log_output_ext.append(t))
+        self.ext_thread.finished_signal.connect(self.on_ext_finished)
+        self.ext_thread.start()
+
+    def on_ext_finished(self, success, msg):
+        self.log_output_ext.append(msg)
+        self.btn_ext_only.setEnabled(True)
+        self.btn_ext_norm.setEnabled(True)
+        self.btn_ext_comfort.setEnabled(True)
+        if success:
+            self.plot_csv_input.setText(self.csv_input.text())
+            self.plot_template_input.setPlainText(self.signal_input.toPlainText())
+            if self.pending_plot_mode != 'none':
+                self.tabs.setCurrentIndex(1)
+                self.start_plot(mode=self.pending_plot_mode)
+
+    # ================= 第2页：绘图 =================
+    def start_plot(self, mode='normal'):
+        csv = self.plot_csv_input.text()
+        tpl = self.plot_template_input.toPlainText()
+        if not os.path.exists(csv):
+            QMessageBox.warning(self, "错误", "CSV 文件不存在，请先选择有效数据源。")
+            return
+        if mode == 'normal' and not tpl.strip():
+            QMessageBox.warning(self, "错误", "绘图模板为空，请先输入或同步模板。")
+            return
+        start_idx, end_idx = self.get_user_plot_range_idx()
+        if self.range_start_input.text().strip() or self.range_end_input.text().strip():
+            if start_idx is None and end_idx is None:
+                QMessageBox.warning(self, "错误", "绘图行数区间必须输入纯数字！")
+                return
+        steady_start_idx, steady_end_idx = self.get_user_steady_idx()
+        wind_speeds = [0.0]
+        for lvl in range(10, 80, 10):
+            wind_speeds.append(self.settings.value(f"wind_speed_{lvl}", lvl / 10.0, type=float))
+        score_txt = self.score_combo.currentText()
+        if "7.0" in score_txt: target_score = 7.0
+        elif "6.0" in score_txt: target_score = 6.0
+        else: target_score = 6.5
+        season_mode = "summer" if "夏季" in self.season_combo.currentText() else "winter"
+        region_mode = "europe" if "欧洲" in self.region_combo.currentText() else "asia"
+
+        self.btn_plot_normal.setEnabled(False)
+        self.btn_plot_comfort.setEnabled(False)
+        self.btn_plot_heating.setEnabled(False)
+        self.log_output_plot.clear()
+
+        self.plot_thread = PlotThread(
+            csv_path=csv, template_text=tpl, plot_mode=mode,
+            wind_speeds=wind_speeds, target_score=target_score,
+            season=season_mode, region=region_mode,
+            start_idx=start_idx, end_idx=end_idx,
+            steady_start_idx=steady_start_idx, steady_end_idx=steady_end_idx
+        )
+        self.plot_thread.update_log_signal.connect(lambda t: self.log_output_plot.append(t))
+        self.plot_thread.finished_signal.connect(self.on_plot_finished)
+        self.plot_thread.start()
+
+    def on_plot_finished(self, success, msg, img_paths=None):
+        if img_paths is None:
+            img_paths = {}
+        self.log_output_plot.append(msg)
+        self.btn_plot_normal.setEnabled(True)
+        self.btn_plot_comfort.setEnabled(True)
+        self.btn_plot_heating.setEnabled(True)
+
+        if not success:
+            return
+
+        if self.plot_thread.plot_mode == 'comfort':
+            if not HAS_DOCX or not HAS_CALC:
+                self.log_output_plot.append("❌ 缺少 docxtpl 或 comfort_report_calc 依赖，已跳过 Word 生成。")
+                return
+            self.log_output_plot.append("\n📝 正在组装舒适性报告文档...")
+            QApplication.processEvents()
+            try:
+                df_calc = pd.read_csv(self.plot_csv_input.text(), index_col=0, parse_dates=True)
+                if self.plot_thread.region == 'europe':
+                    if '对应亚洲设定温度' not in df_calc.columns and '主驾设定温度' in df_calc.columns:
+                        df_calc['对应亚洲设定温度'] = (df_calc['主驾设定温度'] + 2.0).clip(upper=35.0)
+                calc_kwargs = {}
+                sig = inspect.signature(calculate_comfort_report_data)
+                if 'wind_speeds' in sig.parameters:
+                    calc_kwargs['wind_speeds'] = self.plot_thread.wind_speeds
+                if 'steady_start_idx' in sig.parameters:
+                    calc_kwargs['steady_start_idx'] = self.plot_thread.steady_start_idx
+                    calc_kwargs['steady_end_idx'] = self.plot_thread.steady_end_idx
+                if 'log_callback' in sig.parameters:
+                    calc_kwargs['log_callback'] = self.log_output_plot.append
+                if 'target_score' in sig.parameters:
+                    calc_kwargs['target_score'] = self.plot_thread.target_score
+                report_data = calculate_comfort_report_data(df_calc, **calc_kwargs)
+                tpl_path = self.word_tpl_input.text()
+                out_path = self.word_out_input.text()
+                if not os.path.exists(tpl_path):
+                    self.log_output_plot.append(f"⚠️ 找不到 Word 模板: {tpl_path}，已中断写入流程。")
+                    return
+                doc = DocxTemplate(tpl_path)
+                for img_key, file_path in img_paths.items():
+                    if os.path.exists(file_path):
+                        report_data[img_key] = InlineImage(doc, file_path, width=Mm(160))
+                doc.render(report_data)
+                doc.save(out_path)
+                self.log_output_plot.append(f"🎉 舒适性报告生成成功！\n📂 {out_path}")
+                reply = QMessageBox.question(self, "完成", "报告已生成，是否立即打开？", QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    if sys.platform == 'win32': os.startfile(out_path)
+                    elif sys.platform == 'darwin': subprocess.Popen(['open', out_path])
+                    else: subprocess.Popen(['xdg-open', out_path])
+            except Exception:
+                err_str = traceback.format_exc()
+                self.log_output_plot.append(f"❌ 报告失败：\n{err_str}")
+
+        elif self.plot_thread.plot_mode == 'heating':
+            # ---- 调用最大采暖报告生成 ----
+            self.on_heating_report(success, msg, img_paths)
+
+    def on_heating_report(self, success, msg, img_paths):
+        """最大采暖报告生成入口"""
+        if not success:
+            return
+        if not HAS_DOCX:
+            self.log_output_plot.append("❌ 缺少 docxtpl 库，无法生成 Word 报告。")
+            return
+        if not HAS_HEATING_CALC:
+            self.log_output_plot.append("❌ 无法导入 heating_report_calc 模块，请确认 heating_report_calc.py 存在。")
+            return
+
+        self.log_output_plot.append("\n📝 正在生成最大采暖报告...")
+        QApplication.processEvents()
+
+        try:
+            csv_path = self.plot_csv_input.text()
+            df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+
+            # 欧洲车型补偿
+            if self.plot_thread.region == 'europe' and '主驾设定温度' in df.columns:
+                if '对应亚洲设定温度' not in df.columns:
+                    df['对应亚洲设定温度'] = (df['主驾设定温度'] + 2.0).clip(upper=35.0)
+
+            calc_kwargs = {}
+            calc_kwargs['steady_start_idx'] = self.plot_thread.steady_start_idx
+            calc_kwargs['steady_end_idx'] = self.plot_thread.steady_end_idx
+
+            report_data = calculate_heating_report_data(df, **calc_kwargs)
+
+            tpl_path = self.word_tpl_input.text()   # 可复用舒适性模板路径，也可单独设置
+            out_path = self.word_out_input.text()
+            if not os.path.exists(tpl_path):
+                self.log_output_plot.append(f"⚠️ 找不到模板：{tpl_path}")
+                return
+
+            doc = DocxTemplate(tpl_path)
+            for img_key, img_file in img_paths.items():
+                if os.path.exists(img_file):
+                    report_data[img_key] = InlineImage(doc, img_file, width=Mm(160))
+
+            doc.render(report_data)
+            doc.save(out_path)
+            self.log_output_plot.append(f"🎉 最大采暖报告已生成：\n📂 {out_path}")
+
+            reply = QMessageBox.question(self, "完成", "是否立即打开报告？",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                if sys.platform == 'win32':
+                    os.startfile(out_path)
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', out_path])
+                else:
+                    subprocess.Popen(['xdg-open', out_path])
+
+        except Exception:
+            err = traceback.format_exc()
+            self.log_output_plot.append(f"❌ 采暖报告生成失败：\n{err}")
+
+    # ================= 设置持久化 =================
+    def load_settings(self):
+        self.blf_input.setText(self.settings.value("blf_path", ""))
+        self.csv_input.setText(self.settings.value("csv_path", ""))
+        self.signal_input.setPlainText(self.settings.value("signal_text", ""))
+        self.plot_csv_input.setText(self.settings.value("plot_csv", ""))
+        self.plot_template_input.setPlainText(self.settings.value("plot_template", ""))
+        self.word_tpl_input.setText(self.settings.value("word_tpl_path", "报告模板.docx"))
+        self.word_out_input.setText(self.settings.value("word_out_path", "评测报告.docx"))
+        self.range_start_input.setText(self.settings.value("range_start", ""))
+        self.range_end_input.setText(self.settings.value("range_end", ""))
+        self.steady_start_input.setText(self.settings.value("steady_start", ""))
+        self.steady_end_input.setText(self.settings.value("steady_end", ""))
+        self.season_combo.setCurrentIndex(self.settings.value("season_index", 0, type=int))
+        self.score_combo.setCurrentIndex(self.settings.value("score_index", 1, type=int))
+        self.region_combo.setCurrentIndex(self.settings.value("region_index", 0, type=int))
+        output_mode = self.settings.value("output_mode", "sec")
+        if output_mode == "sec": self.radio_sec.setChecked(True)
+        else: self.radio_all.setChecked(True)
+        dbcs = self.settings.value("dbc_files", [])
+        if dbcs:
+            if not isinstance(dbcs, list): dbcs = [dbcs]
+            for f in dbcs:
+                if f and os.path.exists(f) and f not in self.dbc_files:
+                    self.dbc_files.append(f)
+                    self.dbc_listWidget.addItem(os.path.basename(f))
+
+    def closeEvent(self, event):
+        self.settings.setValue("blf_path", self.blf_input.text())
+        self.settings.setValue("csv_path", self.csv_input.text())
+        self.settings.setValue("signal_text", self.signal_input.toPlainText())
+        self.settings.setValue("plot_csv", self.plot_csv_input.text())
+        self.settings.setValue("plot_template", self.plot_template_input.toPlainText())
+        self.settings.setValue("word_tpl_path", self.word_tpl_input.text())
+        self.settings.setValue("word_out_path", self.word_out_input.text())
+        self.settings.setValue("range_start", self.range_start_input.text())
+        self.settings.setValue("range_end", self.range_end_input.text())
+        self.settings.setValue("steady_start", self.steady_start_input.text())
+        self.settings.setValue("steady_end", self.steady_end_input.text())
+        self.settings.setValue("season_index", self.season_combo.currentIndex())
+        self.settings.setValue("score_index", self.score_combo.currentIndex())
+        self.settings.setValue("region_index", self.region_combo.currentIndex())
+        self.settings.setValue("output_mode", "sec" if self.radio_sec.isChecked() else "all")
+        self.settings.setValue("dbc_files", self.dbc_files)
+        super().closeEvent(event)
+
+
+if __name__ == '__main__':
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    win = AppWindow()
+    win.show()
+    sys.exit(app.exec_())
